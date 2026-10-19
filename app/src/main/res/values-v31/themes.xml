@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.MOOD" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/mood_background</item>
+        <!-- Pantalla de arranque del sistema (Android 12+): el orbe sobre el azul del icono; después entra la intro animada. -->
+        <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
+    </style>
+</resources>

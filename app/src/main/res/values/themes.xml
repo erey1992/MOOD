@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.MOOD" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- Mismo lavanda que el fondo de la app para que no haya destello al abrirla. -->
+        <item name="android:windowBackground">@color/mood_background</item>
+    </style>
+</resources>
