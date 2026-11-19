@@ -44,9 +44,9 @@ class TagRepository(private val context: Context) {
 
     /**
      * Reescribe la etiqueta ID3 del fichero. Lanza SecurityException si la app no tiene permiso
-     * de escritura sobre él (en ese caso el fichero no se ha tocado).
+     * de escritura sobre él (en ese caso el fichero no se ha tocado). Un valor null borra el campo.
      */
-    fun write(uri: Uri, text: Map<TagField, String>, artwork: ByteArray?) {
+    fun write(uri: Uri, text: Map<TagField, String?>, artwork: ByteArray?) {
         val resolver = context.contentResolver
         val original = resolver.openInputStream(uri)?.use { it.readBytes() }
             ?: throw IOException("No se pudo leer el fichero")

@@ -23,7 +23,8 @@ object Id3Writer {
         "TYE" to "TYER", "TCO" to "TCON", "TRK" to "TRCK", "TPA" to "TPOS", "TCM" to "TCOM",
     )
 
-    fun rewrite(file: ByteArray, text: Map<TagField, String>, artwork: ByteArray?): ByteArray {
+    /** Un valor null en [text] borra ese campo del fichero. */
+    fun rewrite(file: ByteArray, text: Map<TagField, String?>, artwork: ByteArray?): ByteArray {
         val existing = parse(file)
         val replaced = buildSet {
             text.keys.forEach { addAll(it.frameIds) }
@@ -31,7 +32,7 @@ object Id3Writer {
         }
 
         val frames = existing.frames.filterNot { it.id in replaced }.toMutableList()
-        text.forEach { (field, value) -> frames += Frame(field.frameIds.first(), textFrame(value)) }
+        text.forEach { (field, value) -> if (value != null) frames += Frame(field.frameIds.first(), textFrame(value)) }
         artwork?.let { frames += Frame("APIC", pictureFrame(it)) }
 
         val body = ByteArrayOutputStream()

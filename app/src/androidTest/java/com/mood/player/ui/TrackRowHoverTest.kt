@@ -46,6 +46,7 @@ class TrackRowHoverTest {
                     onLongClick = {},
                     onRename = {},
                     onMove = {},
+                    onEditArtists = {},
                     onDelete = {},
                     onAddToMood = {},
                     onRemoveFromMood = null,

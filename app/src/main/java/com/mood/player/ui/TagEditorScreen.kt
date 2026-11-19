@@ -10,6 +10,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,6 +30,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Button
@@ -45,12 +47,16 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -64,6 +70,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.mood.player.data.LibraryGrouping
 import com.mood.player.data.MetadataCandidate
 import com.mood.player.data.RemoteImages
 import com.mood.player.data.TagField
@@ -123,7 +130,11 @@ fun TagEditorScreen(
             if (selected == null) {
                 SearchContent(state, viewModel)
             } else {
-                ReviewContent(state, selected, viewModel, onSave = { viewModel.save(player) })
+                val collections by player.collections.collectAsState()
+                val knownArtists = remember(collections) {
+                    LibraryGrouping.knownArtists(collections.flatMap { it.tracks }.map { it.artist })
+                }
+                ReviewContent(state, selected, viewModel, knownArtists, onSave = { viewModel.save(player) })
             }
         }
     }
@@ -243,16 +254,35 @@ private fun ReviewContent(
     state: TagEditorState,
     candidate: MetadataCandidate,
     viewModel: TagEditorViewModel,
+    knownArtists: Set<String>,
     onSave: () -> Unit,
 ) {
+    var editingArtists by remember { mutableStateOf(false) }
+    if (editingArtists) {
+        ArtistEditorDialog(
+            subtitle = candidate.tags.title,
+            artists = LibraryGrouping.artistsOf(candidate.tags.artist, null, knownArtists),
+            onConfirm = { keep ->
+                viewModel.setArtists(keep)
+                editingArtists = false
+            },
+            onDismiss = { editingArtists = false },
+        )
+    }
     Column(Modifier.fillMaxSize()) {
         LazyColumn(Modifier.weight(1f)) {
             item {
-                Text(
-                    "Marca los datos que quieres guardar en el fichero. Por defecto solo se marcan los que faltan.",
-                    modifier = Modifier.padding(16.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Marca los datos que quieres guardar en el fichero. Por defecto solo se marcan los que faltan.",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    val changeable = state.changeableFields
+                    TextButton(onClick = viewModel::toggleAll, enabled = changeable.isNotEmpty()) {
+                        Text(if (changeable.isNotEmpty() && state.choices.containsAll(changeable)) "Desmarcar todo" else "Marcar todo")
+                    }
+                }
             }
             item {
                 val canChange = state.proposedArtwork != null
@@ -278,7 +308,7 @@ private fun ReviewContent(
             items(TrackTags.TEXT_FIELDS) { field ->
                 val current = state.current[field]
                 val proposed = candidate.tags[field]
-                val canChange = !proposed.isNullOrBlank() && proposed != current
+                val canChange = state.canChange(field)
                 FieldRow(
                     label = field.label,
                     checked = field in state.choices,
@@ -291,10 +321,18 @@ private fun ReviewContent(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        "Nuevo: ${proposed ?: "—"}",
+                        "Nuevo: ${if (proposed == "" && state.artistEdited) "(sin artista)" else proposed ?: "—"}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = if (canChange) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    // Los resultados suelen traer varios artistas: aquí se eligen cuáles guardar.
+                    if (field == TagField.ARTIST && (!candidate.tags.artist.isNullOrBlank() || state.artistEdited)) {
+                        TextButton(onClick = { editingArtists = true }, contentPadding = PaddingValues(horizontal = 0.dp)) {
+                            Icon(Icons.Rounded.Groups, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Editar artistas")
+                        }
+                    }
                 }
                 HorizontalDivider()
             }

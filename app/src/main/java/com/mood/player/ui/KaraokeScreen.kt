@@ -294,7 +294,7 @@ fun KaraokePage(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(start = 20.dp, end = 8.dp, top = 40.dp, bottom = 8.dp),
+                .padding(start = 20.dp, end = 8.dp, top = 16.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             OrbIcon(OrbPalette[3], Icons.Rounded.Mic, 44.dp)
@@ -399,7 +399,7 @@ fun KaraokePage(
         }
 
         // Controles mínimos para no tener que volver al reproductor.
-        Column(Modifier.padding(horizontal = 24.dp, vertical = 12.dp)) {
+        Column(Modifier.padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 22.dp)) {
             GradientSeekBar(
                 if (state.durationMs > 0) (state.positionMs.toFloat() / state.durationMs).coerceIn(0f, 1f) else 0f,
                 Modifier.fillMaxWidth(),

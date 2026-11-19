@@ -40,11 +40,24 @@ data class TagEditorState(
     val proposedArtwork: ImageBitmap? = null,
     val isLoadingArtwork: Boolean = false,
     val choices: Set<TagField> = emptySet(),
+    /** El usuario ha elegido a mano los artistas del resultado; "" significa dejar la canción sin artista. */
+    val artistEdited: Boolean = false,
     val isSaving: Boolean = false,
     val pendingPermission: IntentSender? = null,
     val error: String? = null,
     val saved: Boolean = false,
-)
+) {
+    /** Si el resultado elegido cambiaría este campo del fichero. */
+    fun canChange(field: TagField): Boolean {
+        if (field == TagField.ARTWORK) return proposedArtwork != null
+        val proposed = selected?.tags?.get(field) ?: return false
+        val current = current[field]
+        if (proposed == current) return false
+        return proposed.isNotBlank() || (field == TagField.ARTIST && artistEdited && !current.isNullOrBlank())
+    }
+
+    val changeableFields: List<TagField> get() = TagField.entries.filter(::canChange)
+}
 
 class TagEditorViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -117,7 +130,7 @@ class TagEditorViewModel(application: Application) : AndroidViewModel(applicatio
         if (s.currentArtwork == null && candidate.artworkUrl != null) defaults += TagField.ARTWORK
 
         _state.update {
-            it.copy(selected = candidate, choices = defaults, proposedArtwork = null, error = null)
+            it.copy(selected = candidate, choices = defaults, proposedArtwork = null, artistEdited = false, error = null)
         }
         proposedArtworkBytes = null
         artworkJob?.cancel()
@@ -147,6 +160,26 @@ class TagEditorViewModel(application: Application) : AndroidViewModel(applicatio
     fun toggle(field: TagField) {
         _state.update {
             it.copy(choices = if (field in it.choices) it.choices - field else it.choices + field)
+        }
+    }
+
+    /** Marca todos los campos que cambiarían o, si ya lo están, los desmarca todos. */
+    fun toggleAll() {
+        _state.update {
+            val all = it.changeableFields.toSet()
+            it.copy(choices = if (it.choices.containsAll(all)) emptySet() else all)
+        }
+    }
+
+    /** Sustituye el artista del resultado por los elegidos en la ventana de artistas (ninguno = sin artista). */
+    fun setArtists(keep: List<String>) {
+        _state.update { s ->
+            val candidate = s.selected ?: return@update s
+            val edited = s.copy(
+                selected = candidate.copy(tags = candidate.tags.with(TagField.ARTIST, keep.joinToString(", "))),
+                artistEdited = true,
+            )
+            edited.copy(choices = if (edited.canChange(TagField.ARTIST)) s.choices + TagField.ARTIST else s.choices - TagField.ARTIST)
         }
     }
 
@@ -180,9 +213,10 @@ class TagEditorViewModel(application: Application) : AndroidViewModel(applicatio
     private fun performSave(player: PlayerViewModel, mediaId: String) {
         val s = _state.value
         val candidate = s.selected ?: return
-        val text = s.choices
+        // Un valor vacío (artista quitado a mano) borra el campo del fichero.
+        val text: Map<TagField, String?> = s.choices
             .filter { it != TagField.ARTWORK }
-            .mapNotNull { field -> candidate.tags[field]?.let { field to it } }
+            .mapNotNull { field -> candidate.tags[field]?.let { field to it.ifBlank { null } } }
             .toMap()
         val artwork = if (TagField.ARTWORK in s.choices) proposedArtworkBytes else null
         val newTags = text.entries.fold(s.current) { tags, (field, value) -> tags.with(field, value) }

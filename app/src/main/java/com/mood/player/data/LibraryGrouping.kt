@@ -78,6 +78,35 @@ object LibraryGrouping {
     private val TITLE_FEATURING = Regex("""(?:\(|\[|\s)(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)""", RegexOption.IGNORE_CASE)
 
     /** Nombres que aparecen como artista propio en algún sitio de la biblioteca (en minúsculas). */
+    /**
+     * Posibles canciones repetidas: mismo título (sin "(Remastered)", "[id]", "(1)", "feat."…) y mismo artista
+     * principal. Las que no tienen artista se juntan con las de su título si todas son del mismo artista.
+     * Devuelve grupos de 2 o más, ordenados por título.
+     */
+    fun <T> duplicateGroups(items: List<T>, title: (T) -> String, artist: (T) -> String?): List<List<T>> {
+        fun artistKey(item: T): String? = artist(item)
+            ?.split(STRONG_SEPARATORS)?.firstOrNull()
+            ?.let(AlbumInfoSource::titleKey)
+            ?.takeIf { it.isNotEmpty() }
+
+        val result = mutableListOf<Pair<String, List<T>>>()
+        items.groupBy { AlbumInfoSource.titleKey(title(it)) }
+            .filterKeys { it.isNotEmpty() }
+            .forEach { (key, sameTitle) ->
+                if (sameTitle.size < 2) return@forEach
+                val (known, unknown) = sameTitle.partition { artistKey(it) != null }
+                val byArtist = known.groupBy { artistKey(it)!! }
+                if (byArtist.size <= 1) {
+                    result += key to sameTitle
+                } else {
+                    // Mismo título de artistas distintos: no son la misma canción.
+                    byArtist.values.filter { it.size >= 2 }.forEach { result += key to it }
+                    if (unknown.size >= 2) result += key to unknown
+                }
+            }
+        return result.sortedBy { it.first }.map { it.second }
+    }
+
     internal fun knownArtists(artists: List<String?>): Set<String> =
         artists.flatMap { raw -> raw.orEmpty().replace('(', ' ').replace(')', ' ').split(STRONG_SEPARATORS) }
             .map { it.trim().lowercase() }
@@ -99,6 +128,44 @@ object LibraryGrouping {
                 if (pieces.size > 1 && pieces.any { it.lowercase() in known }) pieces else listOf(part)
             }
             .distinctBy { it.lowercase() }
+    }
+
+    /** Resultado de quitar artistas a una canción: nuevas etiquetas de artista (null = sin artista) y título. */
+    data class ArtistEdit(val artist: String?, val title: String)
+
+    /** "Canción (feat. X)", "Canción [ft. X]" o "Canción feat. X" al final del título. */
+    private val TITLE_FEATURING_PART = Regex(
+        """\s*(?:[(\[]\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]|\s(?:feat\.?|ft\.?|featuring)\s+[^(\[]+$)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * Deja en la canción solo los artistas de [keep] (de los que da [artistsOf], más los nuevos que se añadan).
+     * Si se quita algún invitado del título ("(feat. X)"), ese trozo desaparece del título y los invitados
+     * que se conservan pasan a la etiqueta de artista. Si no cambia nada, se respeta el texto original.
+     */
+    fun editArtists(artist: String?, title: String, keep: List<String>, known: Set<String>): ArtistEdit {
+        val kept = keep.map { it.trim() }.filter { it.isNotEmpty() }.distinctBy { it.lowercase() }
+        val keptKeys = kept.map { it.lowercase() }.toSet()
+        val tagArtists = artistsOf(artist, null, known)
+        val featured = TITLE_FEATURING.find(title)?.groupValues?.get(1)
+        val titleArtists = artistsOf(featured, null, known)
+        val dropTitlePart = titleArtists.any { it.lowercase() !in keptKeys }
+
+        val newTitle = if (dropTitlePart) title.replace(TITLE_FEATURING_PART, "").trim().ifEmpty { title } else title
+        val inTitle = if (dropTitlePart) emptySet() else titleArtists.map { it.lowercase() }.toSet()
+        val parts = kept.filter { it.lowercase() !in inTitle }
+        val unchanged = parts.map { it.lowercase() } == tagArtists.map { it.lowercase() }
+        return ArtistEdit(
+            artist = if (unchanged) artist else parts.joinToString(", ").ifEmpty { null },
+            title = newTitle,
+        )
+    }
+
+    /** Quita un artista de la canción (comparando sin mayúsculas) y conserva el resto. */
+    fun removeArtist(artist: String?, title: String, name: String, known: Set<String>): ArtistEdit {
+        val keep = artistsOf(artist, title, known).filterNot { it.equals(name.trim(), ignoreCase = true) }
+        return editArtists(artist, title, keep, known)
     }
 
     private fun byAlbum(tracks: List<Track>): List<MusicCollection> {

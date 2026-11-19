@@ -10,6 +10,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.material.icons.rounded.FileCopy
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.first
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Info
@@ -74,6 +79,8 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Groups
+import androidx.compose.material.icons.rounded.PersonRemove
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.Person
@@ -156,6 +163,15 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
     var showPlayer by rememberSaveable { mutableStateOf(false) }
     var showDownloads by rememberSaveable { mutableStateOf(false) }
     var editingMediaId by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Posición de cada pestaña de la biblioteca: se conserva al entrar en un grupo y volver, o al abrir el reproductor.
+    val tabListStates = List(GroupBy.entries.size) { rememberLazyListState() }
+    val moodGridState = rememberLazyGridState()
+
+    /** Último grupo abierto: al volver a su pestaña se asegura de que esté a la vista. */
+    var lastOpenedPath by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(openPath) { openPath?.let { lastOpenedPath = it } }
+    var showDuplicates by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(openDownloads, sharedUrl) {
         if (openDownloads || sharedUrl != null) {
             editingMediaId = null
@@ -304,6 +320,14 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
         ?: groups.values.firstNotNullOfOrNull { list -> list.firstOrNull { it.path == openPath } }
         ?: currentMood?.collection
     BackHandler(enabled = openCollection != null) { openPath = null }
+    BackHandler(enabled = showDuplicates && openCollection == null) { showDuplicates = false }
+    val duplicateGroups = remember(collections) {
+        LibraryGrouping.duplicateGroups(collections.flatMap { it.tracks }.distinctBy { it.uri }, { it.title }, { it.artist })
+    }
+    // Si al borrar ya no queda ninguna repetida, se vuelve a la biblioteca (el botón también desaparece).
+    LaunchedEffect(duplicateGroups.isEmpty(), collections.isEmpty()) {
+        if (showDuplicates && duplicateGroups.isEmpty() && collections.isNotEmpty()) showDuplicates = false
+    }
 
     // Filtro de canciones de la lista abierta; si está activo, la reproducción se hace con lo filtrado.
     var trackFilter by rememberSaveable(openPath) { mutableStateOf("") }
@@ -358,7 +382,28 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
         }
     }
 
+    val knownArtists = remember(collections) {
+        LibraryGrouping.knownArtists(collections.flatMap { it.tracks }.map { it.artist })
+    }
     when (val d = dialog) {
+        is LibraryDialog.EditArtists -> ArtistEditorDialog(
+            subtitle = d.track.title,
+            artists = LibraryGrouping.artistsOf(d.track.artist, d.track.title, knownArtists),
+            onConfirm = { keep ->
+                library.editArtists(d.track, keep, knownArtists, viewModel)
+                finishAction()
+            },
+            onDismiss = { dialog = null },
+        )
+        is LibraryDialog.RemoveArtist -> RemoveArtistDialog(
+            d.name,
+            d.tracks.size,
+            onConfirm = {
+                library.removeArtist(d.tracks, d.name, knownArtists, viewModel)
+                finishAction()
+            },
+            onDismiss = { dialog = null },
+        )
         is LibraryDialog.Rename -> RenameDialog(
             d.track,
             onConfirm = { name ->
@@ -447,9 +492,17 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
                     )
                 } else {
                     MoodTopBar(
-                        title = openCollection?.name,
-                        onBack = if (openCollection != null) ({ openPath = null }) else null,
+                        title = openCollection?.name ?: if (showDuplicates) "Posibles repetidas" else null,
+                        onBack = when {
+                            openCollection != null -> ({ openPath = null })
+                            showDuplicates -> ({ showDuplicates = false })
+                            else -> null
+                        },
                     ) {
+                        // Solo aparece si hay posibles repetidas.
+                        if (openCollection == null && !showDuplicates && duplicateGroups.isNotEmpty()) {
+                            RoundGlassButton(Icons.Rounded.FileCopy, "Posibles canciones repetidas", onClick = { showDuplicates = true })
+                        }
                         RoundGlassButton(Icons.Rounded.Download, "Descargar MP3 de YouTube", onClick = { showDownloads = true })
                         RoundGlassButton(Icons.Rounded.Refresh, "Volver a escanear", onClick = viewModel::loadMusic)
                     }
@@ -500,6 +553,10 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
                         onShuffle = { viewModel.playCollection(visibleCollection, shuffle = true) },
                         onRename = { dialog = LibraryDialog.Rename(it) },
                         onMove = { dialog = LibraryDialog.Move(listOf(it)) },
+                        onEditArtists = { dialog = LibraryDialog.EditArtists(it) },
+                        onRemoveArtist = if (openPath!!.startsWith("artist:") && !openPath!!.endsWith(":?")) {
+                            { dialog = LibraryDialog.RemoveArtist(openCollection.name, openCollection.tracks) }
+                        } else null,
                         onDelete = { requestDelete(listOf(it)) },
                         onAddToMood = { moodDialog = MoodDialog.AddTracks(listOf(it.uri.toString())) },
                         onRemoveFromMood = currentMood?.let { mood ->
@@ -528,9 +585,20 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
                         textAlign = TextAlign.Center,
                         color = colors.textSecondary,
                     )
+                    showDuplicates -> DuplicatesList(
+                        groups = duplicateGroups,
+                        currentMediaId = state.mediaId,
+                        onPlay = { group, index ->
+                            viewModel.playCollection(MusicCollection("duplicates", "Posibles repetidas", group), index, shuffle = false)
+                        },
+                        onDelete = { requestDelete(listOf(it)) },
+                    )
                     else -> LibraryTabs(
                         selected = tab,
                         onSelect = { tab = it },
+                        listStates = tabListStates,
+                        revealPath = lastOpenedPath,
+                        onRevealed = { lastOpenedPath = null },
                         query = searchQueries.getOrElse(tab) { "" },
                         onQueryChange = { text ->
                             if (tab in searchQueries.indices) {
@@ -542,6 +610,9 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
                         moods = {
                             MoodGrid(
                                 moodPlaylists,
+                                state = moodGridState,
+                                revealPath = lastOpenedPath,
+                                onRevealed = { lastOpenedPath = null },
                                 onOpen = { openPath = it.collection.path },
                                 onEdit = { moodDialog = MoodDialog.Edit(it) },
                                 onDelete = { moodDialog = MoodDialog.Delete(it) },
@@ -551,7 +622,8 @@ fun MoodApp(viewModel: PlayerViewModel, sharedUrl: String? = null, openDownloads
                         },
                     )
                 }
-                if (libraryState.busy) {
+                // También mientras se termina de escanear en segundo plano con la lista ya visible.
+                if (libraryState.busy || (isLoading && collections.isNotEmpty())) {
                     LinearProgressIndicator(
                         Modifier
                             .fillMaxWidth()
@@ -641,6 +713,9 @@ fun PermissionScreen(onRequest: () -> Unit) {
 private fun LibraryTabs(
     selected: Int,
     onSelect: (Int) -> Unit,
+    listStates: List<LazyListState>,
+    revealPath: String?,
+    onRevealed: () -> Unit,
     query: String,
     onQueryChange: (String) -> Unit,
     groupsFor: (GroupBy) -> List<MusicCollection>,
@@ -688,7 +763,11 @@ private fun LibraryTabs(
         // Cada pestaña conserva su propia posición de scroll.
         key(selected) {
             val by = GroupBy.entries.getOrNull(selected)
-            if (by != null) GroupList(groupsFor(by), by, onOpen, query, onQueryChange) else moods()
+            if (by != null) {
+                GroupList(groupsFor(by), by, onOpen, query, onQueryChange, listStates[by.ordinal], revealPath, onRevealed)
+            } else {
+                moods()
+            }
         }
     }
 }
@@ -700,6 +779,9 @@ private fun GroupList(
     onOpen: (MusicCollection) -> Unit,
     query: String,
     onQueryChange: (String) -> Unit,
+    listState: LazyListState,
+    revealPath: String?,
+    onRevealed: () -> Unit,
 ) {
     val colors = LocalMoodColors.current
     val searchable = by != GroupBy.FOLDER
@@ -732,8 +814,18 @@ private fun GroupList(
                 textAlign = TextAlign.Center,
             )
         }
+        // Al volver de un grupo, si no está a la vista (p. ej. se abrió desde el reproductor), se lleva hasta él.
+        LaunchedEffect(revealPath, visible) {
+            val target = revealPath ?: return@LaunchedEffect
+            val index = visible.indexOfFirst { it.value.path == target }
+            if (index < 0) return@LaunchedEffect
+            snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it > 0 }
+            if (listState.layoutInfo.visibleItemsInfo.none { it.index == index }) listState.scrollToItem(index)
+            onRevealed()
+        }
         LazyColumn(
             Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -877,6 +969,8 @@ private fun TrackList(
     onShuffle: () -> Unit,
     onRename: (Track) -> Unit,
     onMove: (Track) -> Unit,
+    onEditArtists: (Track) -> Unit,
+    onRemoveArtist: (() -> Unit)?,
     onDelete: (Track) -> Unit,
     onAddToMood: (Track) -> Unit,
     onRemoveFromMood: ((Track) -> Unit)?,
@@ -886,7 +980,7 @@ private fun TrackList(
     val colors = LocalMoodColors.current
     val selectionMode = selectedIds.isNotEmpty()
     val listState = rememberLazyListState()
-    val hasLinks = youtubeQuery != null || onAlbumInfo != null
+    val hasLinks = youtubeQuery != null || onAlbumInfo != null || onRemoveArtist != null
     val showEmpty = collection.tracks.isEmpty() && emptyText != null
     // Elementos antes de la primera canción: botones, filtro, enlaces y aviso de lista vacía.
     val headerCount = 2 + (if (hasLinks) 1 else 0) + (if (showEmpty) 1 else 0)
@@ -937,6 +1031,9 @@ private fun TrackList(
                             primary = false,
                         )
                     }
+                    onRemoveArtist?.let {
+                        PillButton("Borrar autor", Icons.Rounded.PersonRemove, it, Modifier.weight(1f), primary = false)
+                    }
                 }
             }
         }
@@ -971,6 +1068,7 @@ private fun TrackList(
                 onLongClick = { onTrackLongClick(track) },
                 onRename = { onRename(track) },
                 onMove = { onMove(track) },
+                onEditArtists = { onEditArtists(track) },
                 onDelete = { onDelete(track) },
                 onAddToMood = { onAddToMood(track) },
                 onRemoveFromMood = onRemoveFromMood?.let { remove -> { remove(track) } },
@@ -993,6 +1091,7 @@ internal fun TrackRow(
     onLongClick: () -> Unit,
     onRename: () -> Unit,
     onMove: () -> Unit,
+    onEditArtists: () -> Unit,
     onDelete: () -> Unit,
     onAddToMood: () -> Unit,
     onRemoveFromMood: (() -> Unit)?,
@@ -1071,6 +1170,7 @@ internal fun TrackRow(
                     fileActions = track.isManageable,
                     onRename = onRename,
                     onMove = onMove,
+                    onEditArtists = onEditArtists,
                     onDelete = onDelete,
                 )
             } else {
@@ -1132,6 +1232,7 @@ private fun TrackMenu(
     fileActions: Boolean,
     onRename: () -> Unit,
     onMove: () -> Unit,
+    onEditArtists: () -> Unit,
     onDelete: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -1163,6 +1264,11 @@ private fun TrackMenu(
                 text = { Text("Mover a…") },
                 leadingIcon = { Icon(Icons.AutoMirrored.Rounded.DriveFileMove, contentDescription = null) },
                 onClick = { expanded = false; onMove() },
+            )
+            DropdownMenuItem(
+                text = { Text("Editar artistas…") },
+                leadingIcon = { Icon(Icons.Rounded.Groups, contentDescription = null) },
+                onClick = { expanded = false; onEditArtists() },
             )
             DropdownMenuItem(
                 text = { Text("Borrar del dispositivo", color = MaterialTheme.colorScheme.error) },
@@ -1393,9 +1499,10 @@ private fun PlayerScreen(
             count = 2,
             selected = pager.currentPage,
             modifier = Modifier
-                .align(Alignment.TopCenter)
-                .statusBarsPadding()
-                .padding(top = 22.dp),
+                // Abajo, en el hueco bajo los controles: arriba se montaba sobre el botón del karaoke.
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = 7.dp),
         )
     }
 }

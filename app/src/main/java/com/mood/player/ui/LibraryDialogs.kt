@@ -41,6 +41,27 @@ sealed interface LibraryDialog {
     data class Rename(val track: Track) : LibraryDialog
     data class Move(val tracks: List<Track>) : LibraryDialog
     data class Delete(val tracks: List<Track>) : LibraryDialog
+    data class EditArtists(val track: Track) : LibraryDialog
+    data class RemoveArtist(val name: String, val tracks: List<Track>) : LibraryDialog
+}
+
+@Composable
+fun RemoveArtistDialog(name: String, count: Int, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("¿Borrar el artista «$name»?") },
+        text = {
+            Text(
+                "Se quitará «$name» de las etiquetas de " +
+                    (if (count == 1) "1 canción" else "$count canciones") +
+                    ". Los demás artistas de cada canción se conservan y las canciones no se borran."
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Borrar artista", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } },
+    )
 }
 
 @Composable

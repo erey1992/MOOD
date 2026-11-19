@@ -4,6 +4,11 @@ import android.app.Application
 import android.content.ComponentName
 import android.net.Uri
 import android.os.SystemClock
+import android.database.ContentObserver
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.ContextCompat
@@ -19,6 +24,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.mood.player.data.ArtworkLoader
+import com.mood.player.data.LibrarySnapshot
 import com.mood.player.data.MusicCollection
 import com.mood.player.data.MusicRepository
 import com.mood.player.data.Track
@@ -68,6 +74,7 @@ data class PlayerUiState(
 class PlayerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = MusicRepository(application)
+    private val snapshot = LibrarySnapshot(application)
 
     private val _collections = MutableStateFlow<List<MusicCollection>>(emptyList())
     val collections: StateFlow<List<MusicCollection>> = _collections.asStateFlow()
@@ -108,7 +115,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         override fun onEvents(player: Player, events: Player.Events) = refreshState()
     }
 
+    /** Cualquier cambio en la música del dispositivo (también de otras apps) recarga las listas. */
+    private val mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            if (!hasLoaded) return
+            // Un borrado o un escaneo generan varios avisos seguidos: se espera a que se calmen.
+            mediaReloadJob?.cancel()
+            mediaReloadJob = viewModelScope.launch {
+                delay(800)
+                loadMusic()
+            }
+        }
+    }
+    private var mediaReloadJob: Job? = null
+
     init {
+        getApplication<Application>().contentResolver.run {
+            registerContentObserver(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, mediaObserver)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                registerContentObserver(MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL), true, mediaObserver)
+            }
+        }
         // Keep the library current even when the download screen is closed or the app is behind YouTube.
         viewModelScope.launch {
             DownloadStatus.state.map { it.completionVersion }.distinctUntilChanged().collect { version ->
@@ -147,7 +174,16 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         musicLoadJob = viewModelScope.launch {
             _isLoading.value = true
             try {
-                _collections.value = repository.loadCollections()
+                // Lo último que se vio se enseña al instante; el escaneo real sigue en segundo plano.
+                if (_collections.value.isEmpty()) {
+                    _collections.value = withContext(Dispatchers.IO) { snapshot.read() }
+                }
+                // La versión provisional solo se enseña si aún no hay nada: así una recarga no hace parpadear la lista.
+                val scanned = repository.loadCollections(
+                    onPreliminary = { preliminary -> _collections.compareAndSet(emptyList(), preliminary) },
+                )
+                _collections.value = scanned
+                withContext(Dispatchers.IO) { snapshot.write(scanned) }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -231,13 +267,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * Ejecuta [write] (que reescribe el fichero de [mediaId]) con el reproductor detenido para que no
      * esté leyendo el fichero, y después lo recarga en la misma posición con los nuevos datos.
+     * Con [reload] = false no se reescanea la biblioteca (útil al reescribir varias canciones seguidas).
      */
-    suspend fun rewriteTrack(mediaId: String, newTags: TrackTags, write: suspend () -> Unit) {
+    suspend fun rewriteTrack(mediaId: String, newTags: TrackTags, reload: Boolean = true, write: suspend () -> Unit) {
         val c = controller
         if (c == null || c.currentMediaItem?.mediaId != mediaId) {
             write()
             ThumbnailCache.invalidate(Uri.parse(mediaId))
-            loadMusic()
+            if (reload) loadMusic()
             return
         }
 
@@ -261,7 +298,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             artworkMediaId = null // fuerza recargar la carátula
             ThumbnailCache.invalidate(Uri.parse(mediaId))
             refreshState()
-            loadMusic()
+            if (reload) loadMusic()
         }
     }
 
@@ -300,7 +337,22 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /**
+     * Quita al momento de todas las listas las canciones borradas, sin esperar a que se vuelva a leer
+     * la biblioteca (que se recarga a continuación).
+     */
+    fun removeTracksLocally(uris: Set<String>) {
+        _collections.update { folders ->
+            folders.mapNotNull { folder ->
+                val tracks = folder.tracks.filterNot { it.uri.toString() in uris }
+                if (tracks.isEmpty()) null else folder.copy(tracks = tracks)
+            }
+        }
+    }
+
+
     override fun onCleared() {
+        getApplication<Application>().contentResolver.unregisterContentObserver(mediaObserver)
         controller?.removeListener(playerListener)
         MediaController.releaseFuture(controllerFuture)
         controller = null

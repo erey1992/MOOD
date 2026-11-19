@@ -21,6 +21,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.first
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -126,9 +130,22 @@ fun MoodGrid(
     onDelete: (Mood) -> Unit,
     onToggleFavorite: (Mood) -> Unit,
     onCreate: () -> Unit,
+    state: LazyGridState,
+    revealPath: String?,
+    onRevealed: () -> Unit,
 ) {
+    // Al volver de un MOOD que no está a la vista, la cuadrícula se lleva hasta él.
+    LaunchedEffect(revealPath, playlists) {
+        val target = revealPath ?: return@LaunchedEffect
+        val index = playlists.indexOfFirst { it.collection.path == target }
+        if (index < 0) return@LaunchedEffect
+        snapshotFlow { state.layoutInfo.totalItemsCount }.first { it > 0 }
+        if (state.layoutInfo.visibleItemsInfo.none { it.index == index }) state.scrollToItem(index)
+        onRevealed()
+    }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(140.dp),
+        state = state,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),

@@ -4,20 +4,27 @@ import android.app.Application
 import android.app.RecoverableSecurityException
 import android.content.IntentSender
 import android.os.Build
+import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import android.net.Uri
 import com.mood.player.data.FileOperations
+import com.mood.player.data.LibraryGrouping
+import com.mood.player.data.TagField
+import com.mood.player.data.TagRepository
+import com.mood.player.data.TrackTags
 import com.mood.player.data.MoveConflict
 import com.mood.player.data.MoodRepository
 import com.mood.player.data.Track
 import com.mood.player.data.isManageable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class LibraryUiState(
     val busy: Boolean = false,
@@ -38,6 +45,7 @@ data class ConflictSession(
 class LibraryViewModel(application: Application) : AndroidViewModel(application) {
 
     private val files = FileOperations(application)
+    private val tags = TagRepository(application)
     private val moods = MoodRepository.get(application)
 
     private val _state = MutableStateFlow(LibraryUiState())
@@ -56,6 +64,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         val uris = managed.map { it.uri }
         val afterDelete: suspend () -> String = {
             val deleted = uris.map { it.toString() }.toSet()
+            player.removeTracksLocally(deleted)
             player.removeFromQueue(deleted)
             moods.forgetTracks(deleted)
             player.loadMusic()
@@ -88,6 +97,47 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             }
             player.loadMusic()
             "Renombrada a «$name»"
+        }
+    }
+
+    /** Deja en la canción solo los artistas de [keep] (ver [LibraryGrouping.editArtists]). */
+    fun editArtists(track: Track, keep: List<String>, known: Set<String>, player: PlayerViewModel) {
+        val edit = LibraryGrouping.editArtists(track.artist, track.title, keep, known)
+        if (edit.artist == track.artist && edit.title == track.title) return
+        rewriteArtists(listOf(track to edit), player) { "Artistas actualizados" }
+    }
+
+    /** Borra el artista [name] de las etiquetas de todas las [tracks]; las canciones no se tocan más. */
+    fun removeArtist(tracks: List<Track>, name: String, known: Set<String>, player: PlayerViewModel) {
+        val edits = tracks.map { it to LibraryGrouping.removeArtist(it.artist, it.title, name, known) }
+            .filter { (track, edit) -> edit.artist != track.artist || edit.title != track.title }
+        if (edits.isEmpty()) {
+            showMessage("«$name» solo aparece en el nombre de los ficheros: no hay etiqueta que borrar.")
+            return
+        }
+        rewriteArtists(edits, player) { "«$name» quitado de ${plural(edits.size, "canción", "canciones")}" }
+    }
+
+    private fun rewriteArtists(
+        edits: List<Pair<Track, LibraryGrouping.ArtistEdit>>,
+        player: PlayerViewModel,
+        message: () -> String,
+    ) {
+        // Las canciones que no indexa MediaStore (p. ej. descargas en curso) no admiten la petición de permiso.
+        val uris = edits.map { it.first.uri }.filter { it.authority == MediaStore.AUTHORITY }
+        withWritePermission(uris) {
+            edits.forEach { (track, edit) ->
+                val text = buildMap<TagField, String?> {
+                    if (edit.artist != track.artist) put(TagField.ARTIST, edit.artist)
+                    if (edit.title != track.title) put(TagField.TITLE, edit.title)
+                }
+                val newTags = TrackTags(title = edit.title, artist = edit.artist ?: "", album = track.album)
+                player.rewriteTrack(track.uri.toString(), newTags, reload = false) {
+                    withContext(Dispatchers.IO) { tags.write(track.uri, text, artwork = null) }
+                }
+            }
+            player.loadMusic()
+            message()
         }
     }
 
@@ -179,7 +229,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun withWritePermission(uris: List<Uri>, action: suspend () -> String) {
-        val request = files.writeRequest(uris)
+        val request = if (uris.isEmpty()) null else files.writeRequest(uris)
         if (request != null) awaitPermission(request, action) else execute(action)
     }
 

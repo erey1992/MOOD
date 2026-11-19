@@ -7,18 +7,30 @@ import android.os.Build
 import android.provider.MediaStore
 import com.mood.player.download.DownloadStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 class MusicRepository(private val context: Context) {
 
-    /** "uri@fecha" -> etiqueta de álbum real del fichero ("" si no tiene). */
+    /** "uri@fecha" -> etiqueta de álbum real del fichero ("" si no tiene). Se guarda en disco entre sesiones. */
     private val albumTagCache = ConcurrentHashMap<String, String>()
+    private val albumTagFile = File(context.filesDir, "album_tags.tsv")
+    private var albumTagCacheLoaded = false
 
-    /** Busca todos los MP3 del dispositivo y los agrupa por la carpeta que los contiene. */
+    /**
+     * Busca todos los MP3 del dispositivo y los agrupa por la carpeta que los contiene. En cuanto MediaStore
+     * devuelve la lista se entregan las carpetas a [onPreliminary]; lo lento (descargas, etiquetas de álbum
+     * leídas del fichero) se completa después.
+     */
     @Suppress("DEPRECATION") // MediaStore.Audio.Media.DATA sigue siendo legible y da la ruta real
-    suspend fun loadCollections(): List<MusicCollection> = withContext(Dispatchers.IO) {
+    suspend fun loadCollections(
+        onPreliminary: (List<MusicCollection>) -> Unit = {},
+    ): List<MusicCollection> = withContext(Dispatchers.IO) {
         val contentUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         } else {
@@ -88,50 +100,101 @@ class MusicRepository(private val context: Context) {
                     byFolder.getOrPut(folder) { mutableListOf() }.add(track)
                 }
             }
+        onPreliminary(
+            byFolder.map { (folder, tracks) -> MusicCollection(folder, File(folder).name, tracks.toList()) }
+                .sortedBy { it.name.lowercase() }
+        )
 
         val downloads = DownloadStore(context).collections()
-        val downloadedMetadata = downloads.flatMap { it.tracks }.mapNotNull { track ->
-            val mediaUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                runCatching { MediaStore.getMediaUri(context, track.uri) }.getOrNull()
+        // Una consulta al proveedor por pista descargada: se hace una sola vez y se reutiliza.
+        val downloadedMediaIds = downloads.flatMap { it.tracks }.associateWith { track ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching { MediaStore.getMediaUri(context, track.uri) }.getOrNull()?.lastPathSegment
             } else null
-            mediaUri?.lastPathSegment?.let { it to track }
-        }.toMap()
-        val folderNames = byFolder.keys.map { File(it).name.lowercase() }.toSet()
-        byFolder.values.forEach { tracks ->
-            tracks.replaceAll { withRealAlbum(it, modifiedById[it.id] ?: 0L, folderNames) }
+        }
+        val downloadedMetadata = downloadedMediaIds.entries.mapNotNull { (track, id) -> id?.let { it to track } }.toMap()
+
+        fun build(): List<MusicCollection> {
+            val scanned = byFolder.map { (folder, tracks) ->
+                // MediaStore can expose a newly created document before its tags have been scanned.
+                val updated = tracks.map { track ->
+                    downloadedMetadata[track.uri.lastPathSegment]?.let { fresh ->
+                        track.copy(title = fresh.title, artist = fresh.artist, album = fresh.album, durationMs = fresh.durationMs)
+                    } ?: track
+                }
+                MusicCollection(path = folder, name = File(folder).name, tracks = updated)
+            }
+            val scannedUris = scanned.flatMap { it.tracks }.map { it.uri.lastPathSegment }.toSet()
+            val downloaded = downloads.mapNotNull { collection ->
+                val tracks = collection.tracks.filter { track ->
+                    val mediaId = downloadedMediaIds[track]
+                    mediaId == null || mediaId !in scannedUris
+                }
+                collection.copy(tracks = tracks).takeIf { tracks.isNotEmpty() }
+            }
+            return (scanned + downloaded).sortedBy { it.name.lowercase() }
         }
 
-        val scanned = byFolder.map { (folder, tracks) ->
-            // MediaStore can expose a newly created document before its tags have been scanned.
-            val updated = tracks.map { track ->
-                downloadedMetadata[track.uri.lastPathSegment]?.let { fresh ->
-                    track.copy(title = fresh.title, artist = fresh.artist, album = fresh.album, durationMs = fresh.durationMs)
-                } ?: track
-            }
-            MusicCollection(path = folder, name = File(folder).name, tracks = updated)
+        loadAlbumTagCache()
+        val folderNames = byFolder.keys.map { File(it).name.lowercase() }.toSet()
+        val allTracks = byFolder.values.flatten()
+        val pending = allTracks.filter { track ->
+            val album = track.album
+            album != null && album.lowercase() in folderNames && !albumTagCache.containsKey(albumTagKey(track, modifiedById))
         }
-        val scannedUris = scanned.flatMap { it.tracks }.map { it.uri.lastPathSegment }.toSet()
-        val downloaded = downloads.mapNotNull { collection ->
-            val tracks = collection.tracks.filter { track ->
-                val mediaUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    runCatching { MediaStore.getMediaUri(context, track.uri) }.getOrNull()
-                } else null
-                mediaUri == null || mediaUri.lastPathSegment !in scannedUris
-            }
-            collection.copy(tracks = tracks).takeIf { tracks.isNotEmpty() }
+        if (pending.isNotEmpty()) {
+            // Varias lecturas a la vez: cada una pasa casi todo el tiempo esperando al disco.
+            val permits = Semaphore(6)
+            pending.map { track ->
+                async {
+                    permits.withPermit { albumTagCache[albumTagKey(track, modifiedById)] = readAlbumTag(track) }
+                }
+            }.awaitAll()
+            saveAlbumTagCache(allTracks.map { albumTagKey(it, modifiedById) }.toSet())
         }
-        (scanned + downloaded).sortedBy { it.name.lowercase() }
+        byFolder.values.forEach { tracks ->
+            tracks.replaceAll { withRealAlbum(it, modifiedById, folderNames) }
+        }
+        build()
     }
 
     /**
      * Si un MP3 no tiene etiqueta de álbum, MediaStore usa el nombre de su carpeta como álbum. Cuando el
      * álbum coincide con el nombre de alguna carpeta se comprueba la etiqueta real (solo esos casos, con caché).
      */
-    private fun withRealAlbum(track: Track, modified: Long, folderNames: Set<String>): Track {
+    private fun withRealAlbum(track: Track, modifiedById: Map<Long, Long>, folderNames: Set<String>): Track {
         val album = track.album ?: return track
         if (album.lowercase() !in folderNames) return track
-        val realAlbum = albumTagCache.getOrPut("${track.uri}@$modified") { readAlbumTag(track) }
+        val realAlbum = albumTagCache.getOrPut(albumTagKey(track, modifiedById)) { readAlbumTag(track) }
         return if (realAlbum.isEmpty()) track.copy(album = null) else track
+    }
+
+    private fun albumTagKey(track: Track, modifiedById: Map<Long, Long>) = "${track.uri}@${modifiedById[track.id] ?: 0L}"
+
+    private fun loadAlbumTagCache() {
+        if (albumTagCacheLoaded) return
+        albumTagCacheLoaded = true
+        runCatching {
+            if (!albumTagFile.exists()) return
+            albumTagFile.forEachLine { line ->
+                val tab = line.indexOf('\t')
+                if (tab > 0) albumTagCache.putIfAbsent(line.substring(0, tab), line.substring(tab + 1))
+            }
+        }
+    }
+
+    /** Guarda solo las entradas de ficheros que siguen existiendo con la misma fecha de modificación. */
+    private fun saveAlbumTagCache(liveKeys: Set<String>) {
+        albumTagCache.keys.retainAll(liveKeys)
+        runCatching {
+            val tmp = File(albumTagFile.path + ".tmp")
+            tmp.bufferedWriter().use { out ->
+                albumTagCache.forEach { (key, album) ->
+                    out.append(key).append('\t').append(album.replace('\n', ' ').replace('\t', ' ')).append('\n')
+                }
+            }
+            tmp.renameTo(albumTagFile)
+        }
     }
 
     private fun readAlbumTag(track: Track): String {
